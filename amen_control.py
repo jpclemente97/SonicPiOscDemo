@@ -1,59 +1,18 @@
 import numpy as np
-import pandas as pd
-import sklearn
+import joblib
 from sklearn import *
-from IPython.display import clear_output
-
-from pythonosc import dispatcher
-from pythonosc import osc_server
-from pythonosc import osc_message_builder
-from pythonosc import udp_client
-
+from pythonosc import dispatcher, osc_server, udp_client
 import asyncio
 
+# Restoring our regressor model from a file
+joblib_file = "./data/mlp_model.pkl"
+mlp = joblib.load(joblib_file)
 
-#### read dataset
-dataset = pd.read_csv('./data/data.csv')
-
-#importing the columns with accelerometer (gravity) data on the three exis
-rawdata = dataset[['x', 'y', 'z']].to_numpy()
-inputs = np.empty((0,3))
-target = np.empty((inputs.shape[0],2))
-
-#iterating through the entries of the dataset and creating associated target values
-#the index edges for the postures have been found manually by visually inspecting the waveforms
-for i in range(0,rawdata.shape[0]):
-    if (2 <= i <= 1025):
-        inputs = np.append(inputs, rawdata[i,:].reshape(1,-1), axis=0)
-        target = np.append(target, np.array([[1.,1.]]), axis=0) #looking at phone
-    elif (1052 <= i <= 1990):
-        inputs = np.append(inputs, rawdata[i,:].reshape(1,-1), axis=0)
-        target = np.append(target, np.array([[1.,0.]]), axis=0) #face level to the left
-    elif (2007 <= i <= 3010):
-        inputs = np.append(inputs, rawdata[i,:].reshape(1,-1), axis=0)
-        target = np.append(target, np.array([[0.,1.]]), axis=0) #face level upwards
-    elif (3050 <= i <= 3937):
-        inputs = np.append(inputs, rawdata[i,:].reshape(1,-1), axis=0)
-        target = np.append(target, np.array([[0.,0.]]), axis=0) #face level downwards
-
-
-#creating train/test split
-inputs_train, inputs_test, target_train, target_test = sklearn.model_selection.train_test_split(inputs, target, test_size=0.1)
-
-#training the model
-mlp = sklearn.neural_network.MLPRegressor(hidden_layer_sizes=(8,4), max_iter=20000, activation='logistic')
-mlp.fit(inputs_train, target_train)
-target_predict =  mlp.predict(inputs_test)
-
-
-#print the number of misclassified samples, accuracy and complete report (using scikit learn metric tools) 
-print('r2 score on individual targets',sklearn.metrics.r2_score(target_test, target_predict, multioutput='raw_values'))
-
-
+# Initializing variables
 acc_vect = np.zeros((1,3))
-cutoff, rate = 0, 0
+cutoff, rate = 100, 0.5
 
-#creating a function that will handle and push accelerometer through the regressor
+# Creating a function that will handle and push accelerometer through the regressor
 def acceleration_vector(address, args):
     global cutoff, rate
     if address.find('accelerometer/x') != -1:
@@ -62,41 +21,69 @@ def acceleration_vector(address, args):
         acc_vect[0,1] = args
     elif address.find('accelerometer/z') != -1:
         acc_vect[0,2] = args
-        clear_output(wait=True)
         pred = mlp.predict(acc_vect)
-        print('Parameters   %.3f'%pred.flat[0], '  %.3f' %pred.flat[1])
+        print('Cutoff:    %.1f'%cutoff, '\tRate:    %.3f' %rate)
+
+        # Scaling the values sent to Sonic Pi
         cutoff = (pred.flat[0] + 1) * 50
         cutoff = int(cutoff)
-        rate = round(pred.flat[1], 3)
+        if cutoff > 130: cutoff = 130
+        rate = (pred.flat[1] + 1) / 2
+        rate = np.fmax(rate, 0.001)
+        rate = np.fmin(rate, 1)
 
-#attaching the function to the dispatcher
+# Attaching the function to the dispatcher
 dispatcher = dispatcher.Dispatcher()
 dispatcher.map("/accelerometer/*", acceleration_vector)
 
 
+# Aking user for IP and OSCHook ports
+ip = str(input("\n\n\nWhat is your IP adress? \n> "))
+print("\nIP adress:", ip)
+phone_port = int(input("\n\nWhat is OSCHooks (UDP) Port? \n> "))
+print("\nOSCHook Port:", phone_port)
 
-ip = "192.168.0.10"
+# Sonic Pi uses UDP 4560 by default
 sonic_port = 4560
-phone_port = 8001
 
+# Asking for how long the user want to control the app (in seconds or forever)
+control_time = input("\n\nHow many seconds will you run this server? (Leave blank for forever)\n> ")
+if control_time == "":
+    control_time = 0
+elif int(control_time) > 0:
+    control_time = int(control_time) * 1000
+print("")
+
+
+# Sender (UDPClient) handling messages to Sonic Pi
 sender = udp_client.SimpleUDPClient(ip, sonic_port)
 
 
-async def loop():
-    """Example main loop that only runs for 10 iterations before finishing"""
-    for i in range(1000):
-        #print(f"Loop {i}")
-        sender.send_message('/control/amen', [cutoff, rate])
-        await asyncio.sleep(0.01)
+# Async main loop for sending messages to Sonic Pi
+async def loop(control_time=False):
+
+    # Loop running for as many seconds as the user specified
+    if control_time > 0:
+        for i in range(control_time):
+            sender.send_message('/control/amen', [cutoff, rate])
+            await asyncio.sleep(0.001)
+
+    # Loop running forever
+    else:
+        while True:
+            sender.send_message('/control/amen', [cutoff, rate])
+            await asyncio.sleep(0.001)
 
 
+# Initializing of server event loop for grabbing OSC from phone
 async def init_main():
     server = osc_server.AsyncIOOSCUDPServer((ip, phone_port), dispatcher, asyncio.get_event_loop())
     transport, protocol = await server.create_serve_endpoint()  # Create datagram endpoint and start serving
 
-    await loop()  # Enter main loop of program
+    await loop(control_time)  # Enter main loop of program
 
     transport.close()  # Clean up serve endpoint
 
 
+# AsyncIO loop handling both OSC server (from phone) and OSC messages (to Sonic Pi)
 asyncio.run(init_main())
